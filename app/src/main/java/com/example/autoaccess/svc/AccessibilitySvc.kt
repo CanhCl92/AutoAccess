@@ -1,154 +1,163 @@
 package com.example.autoaccess.svc
 
 import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.GestureDescription
-import android.graphics.Path
+import android.graphics.Rect
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
-import android.view.Display
-import android.view.WindowInsets
-import android.view.WindowManager
-import android.view.accessibility.AccessibilityEvent
-import android.hardware.display.DisplayManager
-import kotlin.math.roundToInt
+import com.example.autoaccess.cap.ScreenCapture
+import com.example.autoaccess.mapp.ContentRect
+import com.example.autoaccess.mapp.CoordMapper
+import com.example.autoaccess.mapp.DebugOverlay
+import com.example.autoaccess.mapp.InsetsPx
+import com.example.autoaccess.mapp.MappingDebugServer
+import com.example.autoaccess.mapp.PhysSize
+import com.example.autoaccess.util.HttpServer   // giữ đúng util server bạn đang dùng
 
+/**
+ * Accessibility service chính của AutoAccess.
+ * ĐÃ tích hợp:
+ *  - DebugOverlay (TYPE_ACCESSIBILITY_OVERLAY)
+ *  - MappingDebugServer với các endpoint /map/...
+ *  - spacesProvider() dùng physical + insets + contentRect
+ */
 class AccessibilitySvc : AccessibilityService() {
 
-    companion object {
-        private const val TAG = "AutoAccess"
-        @Volatile var instance: AccessibilitySvc? = null
-            private set
-    }
+    // --- Các thành phần bạn đã có trong dự án ---
+    // Lưu ý: nếu tên khác, đổi lại cho khớp:
+    private lateinit var screenCapture: ScreenCapture
+    private lateinit var debugHttp: HttpServer
+    private lateinit var gestureSender: GestureSender   // helper dispatchGesture của bạn
 
-    data class DispInfo(
-        val w: Int, val h: Int,
-        val insetLeft: Int, val insetTop: Int, val insetRight: Int, val insetBottom: Int
-    )
+    // Nếu bạn có DisplayInfo riêng chứa insets (như log bạn in ra), dùng lại ở đây:
+    // Ví dụ:
+    // data class DisplayInfo(val insetsL:Int, val insetsT:Int, val insetsR:Int, val insetsB:Int, ...)
+    private lateinit var displayInfo: DisplayInfo
+
+    // --- Phần thêm mới cho mapping/calib ---
+    private lateinit var overlay: DebugOverlay
+    private var mapServer: MappingDebugServer? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        instance = this
-        Log.i(TAG, "AccessibilitySvc connected")
+        Log.i("AccessibilitySvc", "onServiceConnected()")
 
-        try {
-            val sp = getSharedPreferences("aliases", MODE_PRIVATE)
-            for ((k, v) in sp.all) if (v is String) AliasRegistry.put(k, v)
-        } catch (t: Throwable) {
-            Log.w(TAG, "load aliases failed", t)
+        // TODO: nếu bạn đã có luồng init screenCapture/debugHttp/gestureSender/displayInfo,
+        // hãy gán vào ở đây hoặc đảm bảo các field trên được set trước khi gọi initMappingDebug().
+
+        // Gắn overlay (TYPE_ACCESSIBILITY_OVERLAY)
+        overlay = DebugOverlay.attach(this)
+
+        // Khởi tạo server debug cho mapping nếu có debugHttp
+        initMappingDebug()
+    }
+
+    override fun onAccessibilityEvent(event: android.view.accessibility.AccessibilityEvent?) {
+        // Giữ nguyên logic hiện tại của bạn
+    }
+
+    override fun onInterrupt() {
+        // Giữ nguyên
+    }
+
+    // ---------------- Mapping Debug ----------------
+
+    /** Cấp dữ liệu không gian cho mapper: physical + insets + contentRect. */
+    private fun spacesProvider(): CoordMapper.Spaces {
+        val physW = currentPhysicalWidth()
+        val physH = currentPhysicalHeight()
+
+        val insets = readSystemInsetsPx() // Lấy từ displayInfo (ưu tiên), fallback 0
+        val contentRect = readCaptureContentRect() // từ ScreenCapture
+
+        return CoordMapper.Spaces(
+            phys = PhysSize(physW, physH),
+            insets = insets,
+            content = ContentRect(contentRect)
+        )
+    }
+
+    /** Khởi tạo các endpoint /map/... vào debug server sẵn có. */
+    private fun initMappingDebug() {
+        if (!::debugHttp.isInitialized || !::screenCapture.isInitialized || !::gestureSender.isInitialized) {
+            Log.w("AccessibilitySvc", "MappingDebugServer không khởi tạo vì thiếu debugHttp / screenCapture / gestureSender")
+            return
         }
-        if (!HttpServer.isRunning()) HttpServer.start(applicationContext)
+        mapServer = MappingDebugServer(
+            service = this,
+            capture = screenCapture,
+            spacesProvider = ::spacesProvider,
+            gesture = gestureSender,
+            http = debugHttp
+        )
+        Log.i("AccessibilitySvc", "MappingDebugServer ready: /map/params, /map/showCrosshair, /map/tap, /map/calib3, /map/captureAt")
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        Log.i(TAG, "AccessibilitySvc destroyed")
-        HttpServer.stop()
-        instance = null
-    }
+    // ---------------- Helpers ----------------
 
-    override fun onInterrupt() {}
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
-
-    fun tap(x: Float, y: Float, durMs: Long = 80L): Boolean {
-        val g = buildTap(x.toInt(), y.toInt(), durMs)
-        val scheduled = dispatchGesture(g, object : GestureResultCallback() {
-            override fun onCompleted(gestureDescription: GestureDescription?) {
-                Log.i(TAG, "tap completed at (${x.toInt()},${y.toInt()})")
+    private fun currentPhysicalWidth(): Int {
+        return try {
+            if (Build.VERSION.SDK_INT >= 23) {
+                display?.mode?.physicalWidth ?: resources.displayMetrics.widthPixels
+            } else {
+                resources.displayMetrics.widthPixels
             }
-            override fun onCancelled(gestureDescription: GestureDescription?) {
-                Log.w(TAG, "tap CANCELLED at (${x.toInt()},${y.toInt()})")
-            }
-        }, null)
-        Log.i(TAG, "tap schedule=$scheduled at (${x.toInt()},${y.toInt()})")
-        return scheduled
-    }
-
-    fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, durMs: Long = 300L): Boolean {
-        val g = buildSwipe(x1.toInt(), y1.toInt(), x2.toInt(), y2.toInt(), durMs)
-        val scheduled = dispatchGesture(g, object : GestureResultCallback() {
-            override fun onCompleted(gestureDescription: GestureDescription?) {
-                Log.i(TAG, "swipe completed ${x1.toInt()},${y1.toInt()} -> ${x2.toInt()},${y2.toInt()}")
-            }
-            override fun onCancelled(gestureDescription: GestureDescription?) {
-                Log.w(TAG, "swipe CANCELLED ${x1.toInt()},${y1.toInt()} -> ${x2.toInt()},${y2.toInt()}")
-            }
-        }, null)
-        Log.i(TAG, "swipe schedule=$scheduled ${x1.toInt()},${y1.toInt()} -> ${x2.toInt()},${y2.toInt()}")
-        return scheduled
-    }
-
-    fun back()   { performGlobalAction(GLOBAL_ACTION_BACK) }
-    fun home()   { performGlobalAction(GLOBAL_ACTION_HOME) }
-    fun recent() { performGlobalAction(GLOBAL_ACTION_RECENTS) }
-
-    fun buildTap(x: Int, y: Int, ms: Long = 80L): GestureDescription {
-        val p = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
-        val stroke = GestureDescription.StrokeDescription(p, 0, ms.coerceAtLeast(1L))
-        return GestureDescription.Builder().addStroke(stroke).build()
-    }
-
-    fun buildSwipe(x1: Int, y1: Int, x2: Int, y2: Int, ms: Long = 300L): GestureDescription {
-        val p = Path().apply {
-            moveTo(x1.toFloat(), y1.toFloat())
-            lineTo(x2.toFloat(), y2.toFloat())
-        }
-        val dur = ms.coerceAtLeast(1L)
-        val stroke = if (Build.VERSION.SDK_INT >= 26)
-            GestureDescription.StrokeDescription(p, 0, dur, false)
-        else
-            GestureDescription.StrokeDescription(p, 0, dur)
-        return GestureDescription.Builder().addStroke(stroke).build()
-    }
-
-    /** Giữ lại cho tương thích cũ (trả logical size). */
-    fun displaySize(): Pair<Int, Int> {
-        return if (Build.VERSION.SDK_INT >= 30) {
-            val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-            val b = wm.currentWindowMetrics.bounds
-            b.width() to b.height()
-        } else {
-            val dm = resources.displayMetrics
-            dm.widthPixels to dm.heightPixels
+        } catch (_: Throwable) {
+            resources.displayMetrics.widthPixels
         }
     }
 
-    /**
-     * MỚI: trả về kích thước **vật lý** (physical) của display + insets **đã quy đổi về physical**.
-     * Dùng số này cho mọi phép map tọa độ gesture.
-     */
-    fun displayInfo(): DispInfo {
-        return if (Build.VERSION.SDK_INT >= 30) {
-            val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-            val metrics = wm.currentWindowMetrics
-            val bounds = metrics.bounds
-            val winW = bounds.width()
-            val winH = bounds.height()
+    private fun currentPhysicalHeight(): Int {
+        return try {
+            if (Build.VERSION.SDK_INT >= 23) {
+                display?.mode?.physicalHeight ?: resources.displayMetrics.heightPixels
+            } else {
+                resources.displayMetrics.heightPixels
+            }
+        } catch (_: Throwable) {
+            resources.displayMetrics.heightPixels
+        }
+    }
 
-            // Lấy kích thước PHYSICAL theo rotation hiện tại
-            val dmgr = getSystemService(DISPLAY_SERVICE) as DisplayManager
-            val disp: Display = dmgr.getDisplay(Display.DEFAULT_DISPLAY)
-            val mode = disp.mode
-            val rot = disp.rotation
-            val physW = if (rot == android.view.Surface.ROTATION_90 || rot == android.view.Surface.ROTATION_270)
-                mode.physicalHeight else mode.physicalWidth
-            val physH = if (rot == android.view.Surface.ROTATION_90 || rot == android.view.Surface.ROTATION_270)
-                mode.physicalWidth else mode.physicalHeight
+    private fun readSystemInsetsPx(): InsetsPx {
+        return try {
+            if (::displayInfo.isInitialized) {
+                // Ưu tiên dùng đúng nguồn insets bạn đã log: “insets L:.. T:.. R:.. B:..”
+                InsetsPx(
+                    left = displayInfo.insetsL,
+                    top = displayInfo.insetsT,
+                    right = displayInfo.insetsR,
+                    bottom = displayInfo.insetsB
+                )
+            } else {
+                // Fallback nếu chưa có displayInfo
+                InsetsPx(0, 0, 0, 0)
+            }
+        } catch (_: Throwable) {
+            InsetsPx(0, 0, 0, 0)
+        }
+    }
 
-            // Insets ở WINDOW space → scale sang PHYSICAL
-            val insWin = metrics.windowInsets.getInsetsIgnoringVisibility(
-                WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout()
-            )
-            val kx = if (winW > 0) physW.toFloat() / winW.toFloat() else 1f
-            val ky = if (winH > 0) physH.toFloat() / winH.toFloat() else 1f
-            val l = (insWin.left   * kx).roundToInt()
-            val t = (insWin.top    * ky).roundToInt()
-            val r = (insWin.right  * kx).roundToInt()
-            val b = (insWin.bottom * ky).roundToInt()
-
-            DispInfo(physW, physH, l, t, r, b)
-        } else {
-            val dm = resources.displayMetrics
-            DispInfo(dm.widthPixels, dm.heightPixels, 0, 0, 0, 0)
+    private fun readCaptureContentRect(): Rect {
+        return try {
+            // Nếu ScreenCapture của bạn có contentRect sẵn, dùng nó;
+            // nếu không, mặc định full buffer capture.
+            screenCapture.contentRect ?: Rect(0, 0, screenCapture.width, screenCapture.height)
+        } catch (_: Throwable) {
+            Rect(0, 0, resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels)
         }
     }
 }
+
+/** Placeholder cho GestureSender nếu file này không nhìn thấy import; bạn có thể xóa nếu đã có class thật trong dự án. */
+interface GestureSender {
+    fun tap(x: Float, y: Float)
+}
+
+/** Placeholder cho DisplayInfo nếu bạn đã có class tương tự; đổi cho khớp dự án hoặc xóa phần này. */
+data class DisplayInfo(
+    val insetsL: Int,
+    val insetsT: Int,
+    val insetsR: Int,
+    val insetsB: Int
+)
